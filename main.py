@@ -1,3 +1,4 @@
+# filename: server.py
 import os
 import asyncio
 import httpx
@@ -34,7 +35,7 @@ if not GOOGLE_API_KEY:
 app = FastAPI(
     title="Intelligent Query-Retrieval System (Gemini Edition)",
     description="Process PDFs, DOCX, and email documents and answer contextual questions using a RAG pipeline with Google Gemini.",
-    version="1.6.0" # Version bumped for quality improvements
+    version="1.7.1" # Version bumped for bug fix
 )
 
 # --- Pydantic Models for API Data Validation ---
@@ -70,20 +71,15 @@ def _parse_email(content: bytes) -> str:
                 soup = BeautifulSoup(html_content, "html.parser")
                 text_content += soup.get_text()
     else:
-        content_type = msg.get_content_type()
-        if content_type == "text/plain":
-            text_content = msg.get_payload(decode=True).decode(errors='ignore')
-        elif content_type == "text/html":
-            html_content = msg.get_payload(decode=True).decode(errors='ignore')
-            soup = BeautifulSoup(html_content, "html.parser")
-            text_content = soup.get_text()
-            
+        payload = msg.get_payload(decode=True)
+        if payload:
+            text_content = payload.decode(errors='ignore')
     return text_content
 
-def get_document_text(url: str) -> str:
+async def get_document_text(url: str) -> str:
     try:
-        with httpx.Client(follow_redirects=True, timeout=30) as client:
-            response = client.get(url)
+        async with httpx.AsyncClient(follow_redirects=True, timeout=30.0) as client:
+            response = await client.get(url)
             response.raise_for_status()
             content = response.content
             content_type = response.headers.get("content-type", "").lower()
@@ -95,7 +91,7 @@ def get_document_text(url: str) -> str:
             elif url.lower().endswith(".eml") or "message/rfc822" in content_type:
                 return _parse_email(content)
             else:
-                raise HTTPException(status_code=400, detail="Unsupported document type. Please provide a URL for a PDF, DOCX, or EML file.")
+                raise HTTPException(status_code=400, detail="Unsupported document type.")
 
     except httpx.RequestError as e:
         raise HTTPException(status_code=400, detail=f"Failed to download document from URL: {e}")
@@ -111,20 +107,19 @@ def get_text_chunks(text: str) -> List[str]:
     )
     return text_splitter.split_text(text)
 
-def get_vector_store(text_chunks: List[str]):
+async def get_vector_store(text_chunks: List[str]):
     try:
         embeddings = GoogleGenerativeAIEmbeddings(
             model="models/embedding-001",
             google_api_key=GOOGLE_API_KEY
         )
-        vector_store = FAISS.from_texts(texts=text_chunks, embedding=embeddings)
+        # THE FIX IS HERE:
+        vector_store = await FAISS.afrom_texts(texts=text_chunks, embedding=embeddings)
         return vector_store
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to create vector store with Google embeddings: {e}")
 
-# --- ★★★ KEY CHANGE #1: THE PROMPT ★★★ ---
 def get_rag_chain(retriever):
-    """Builds the RAG chain with an improved, more prescriptive prompt."""
     prompt_template = """
     You are a highly skilled AI assistant specialized in analyzing insurance policy documents.
     Your task is to answer the user's question based *exclusively* on the provided context.
@@ -148,7 +143,7 @@ def get_rag_chain(retriever):
     llm = ChatGoogleGenerativeAI(
         model="gemini-1.5-flash-latest", 
         google_api_key=GOOGLE_API_KEY,
-        temperature=0, # Temperature 0 is good for factual answers
+        temperature=0,
         convert_system_message_to_human=True
     )
     
@@ -160,7 +155,6 @@ def get_rag_chain(retriever):
     )
     return rag_chain
 
-# --- API Endpoint ---
 @app.post("/hackrx/run", response_model=QueryResponse)
 async def process_document_and_answer_questions(
     request: QueryRequest,
@@ -169,7 +163,7 @@ async def process_document_and_answer_questions(
     if not API_BEARER_TOKEN or not authorization or authorization.split(" ")[1] != API_BEARER_TOKEN:
         raise HTTPException(status_code=401, detail="Invalid or missing Bearer token")
 
-    document_text = get_document_text(request.documents)
+    document_text = await get_document_text(request.documents)
     if not document_text:
         raise HTTPException(status_code=500, detail="Could not extract text from the document.")
 
@@ -177,10 +171,8 @@ async def process_document_and_answer_questions(
     if not text_chunks:
         raise HTTPException(status_code=500, detail="Document is empty or text could not be chunked.")
 
-    vector_store = get_vector_store(text_chunks)
+    vector_store = await get_vector_store(text_chunks)
     
-    # --- ★★★ KEY CHANGE #2: THE RETRIEVER ★★★ ---
-    # Retrieve 5 chunks instead of 4 to provide a slightly larger context, helping to find answers.
     retriever = vector_store.as_retriever(search_type="similarity", search_kwargs={"k": 5})
     
     rag_chain = get_rag_chain(retriever)
