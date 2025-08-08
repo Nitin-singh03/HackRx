@@ -10,7 +10,7 @@ import docx
 
 from fastapi import FastAPI, HTTPException, Header
 from pydantic import BaseModel, Field
-from typing import List
+from typing import List, Dict
 from dotenv import load_dotenv
 
 # Document processing and RAG components
@@ -29,16 +29,19 @@ API_BEARER_TOKEN = os.getenv("API_BEARER_TOKEN")
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 
 if not GOOGLE_API_KEY:
-    raise ValueError("GOOGLE_API_KEY not found in environment variables. Please set it in a .env file.")
+    raise ValueError("GOOGLE_API_KEY not found in environment variables.")
+
+# --- In-Memory Cache ---
+VECTOR_STORE_CACHE: Dict[str, FAISS] = {}
 
 # --- FastAPI App Initialization ---
 app = FastAPI(
     title="Intelligent Query-Retrieval System (Gemini Edition)",
-    description="Process PDFs, DOCX, and email documents and answer contextual questions using a RAG pipeline with Google Gemini.",
-    version="1.7.1" # Version bumped for bug fix
+    description="An efficient, cached RAG pipeline for processing documents.",
+    version="2.0.1" # Version bumped for prompt fix
 )
 
-# --- Pydantic Models for API Data Validation ---
+# --- Pydantic Models (Unchanged) ---
 class QueryRequest(BaseModel):
     documents: str = Field(..., description="URL to the document (PDF, DOCX, EML) to be processed.")
     questions: List[str] = Field(..., min_items=1, description="List of questions to ask about the document.")
@@ -46,9 +49,7 @@ class QueryRequest(BaseModel):
 class QueryResponse(BaseModel):
     answers: List[str]
 
-# --- Core RAG Logic ---
-
-# --- Document Parsers (Unchanged) ---
+# --- Core Logic Functions (Unchanged) ---
 def _parse_pdf(content: bytes) -> str:
     with fitz.open(stream=content, filetype="pdf") as doc:
         return "".join(page.get_text() for page in doc)
@@ -83,43 +84,26 @@ async def get_document_text(url: str) -> str:
             response.raise_for_status()
             content = response.content
             content_type = response.headers.get("content-type", "").lower()
-
             if url.lower().endswith(".pdf") or "application/pdf" in content_type:
                 return _parse_pdf(content)
-            elif url.lower().endswith(".docx") or "application/vnd.openxmlformats-officedocument.wordprocessingml.document" in content_type:
+            elif url.lower().endswith(".docx"):
                 return _parse_docx(content)
             elif url.lower().endswith(".eml") or "message/rfc822" in content_type:
                 return _parse_email(content)
             else:
                 raise HTTPException(status_code=400, detail="Unsupported document type.")
-
     except httpx.RequestError as e:
         raise HTTPException(status_code=400, detail=f"Failed to download document from URL: {e}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to process document: {str(e)}")
 
-
 def get_text_chunks(text: str) -> List[str]:
-    text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=1200,
-        chunk_overlap=250,
-        length_function=len
-    )
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=1200, chunk_overlap=250, length_function=len)
     return text_splitter.split_text(text)
 
-async def get_vector_store(text_chunks: List[str]):
-    try:
-        embeddings = GoogleGenerativeAIEmbeddings(
-            model="models/embedding-001",
-            google_api_key=GOOGLE_API_KEY
-        )
-        # THE FIX IS HERE:
-        vector_store = await FAISS.afrom_texts(texts=text_chunks, embedding=embeddings)
-        return vector_store
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to create vector store with Google embeddings: {e}")
-
+# ★★★ THIS FUNCTION IS NOW CORRECTED ★★★
 def get_rag_chain(retriever):
+    """Builds the RAG chain with the full, correct prompt."""
     prompt_template = """
     You are a highly skilled AI assistant specialized in analyzing insurance policy documents.
     Your task is to answer the user's question based *exclusively* on the provided context.
@@ -155,6 +139,7 @@ def get_rag_chain(retriever):
     )
     return rag_chain
 
+# --- Main API Endpoint with Caching Logic ---
 @app.post("/hackrx/run", response_model=QueryResponse)
 async def process_document_and_answer_questions(
     request: QueryRequest,
@@ -163,18 +148,29 @@ async def process_document_and_answer_questions(
     if not API_BEARER_TOKEN or not authorization or authorization.split(" ")[1] != API_BEARER_TOKEN:
         raise HTTPException(status_code=401, detail="Invalid or missing Bearer token")
 
-    document_text = await get_document_text(request.documents)
-    if not document_text:
-        raise HTTPException(status_code=500, detail="Could not extract text from the document.")
+    doc_url = request.documents
 
-    text_chunks = get_text_chunks(document_text)
-    if not text_chunks:
-        raise HTTPException(status_code=500, detail="Document is empty or text could not be chunked.")
+    if doc_url in VECTOR_STORE_CACHE:
+        print(f"CACHE HIT: Reusing vector store for {doc_url}")
+        vector_store = VECTOR_STORE_CACHE[doc_url]
+    else:
+        print(f"CACHE MISS: Building new vector store for {doc_url}")
+        document_text = await get_document_text(doc_url)
+        if not document_text:
+            raise HTTPException(status_code=500, detail="Could not extract text from the document.")
 
-    vector_store = await get_vector_store(text_chunks)
-    
+        text_chunks = get_text_chunks(document_text)
+        if not text_chunks:
+            raise HTTPException(status_code=500, detail="Document is empty or text could not be chunked.")
+
+        try:
+            embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001", google_api_key=GOOGLE_API_KEY)
+            vector_store = await FAISS.afrom_texts(texts=text_chunks, embedding=embeddings)
+            VECTOR_STORE_CACHE[doc_url] = vector_store
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Failed to create vector store: {e}")
+
     retriever = vector_store.as_retriever(search_type="similarity", search_kwargs={"k": 5})
-    
     rag_chain = get_rag_chain(retriever)
     
     tasks = [rag_chain.ainvoke(question) for question in request.questions]
@@ -188,4 +184,4 @@ async def process_document_and_answer_questions(
 
 @app.get("/")
 def read_root():
-    return {"status": "ok", "message": "Intelligent Query-Retrieval System (Gemini Edition) is running."}
+    return {"status": "ok", "message": f"Intelligent Query-Retrieval System is running. Items in cache: {len(VECTOR_STORE_CACHE)}"}
